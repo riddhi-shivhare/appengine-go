@@ -20,18 +20,124 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"path"
 	"strconv"
+	"sync"
 	"time"
 
+	timestamppb "google.golang.org/protobuf/types/known/timestamppb"
+	cloudtasks "cloud.google.com/go/cloudtasks/apiv2"
+	taskspb "cloud.google.com/go/cloudtasks/apiv2/cloudtaskspb"
+	cloudtasksv2beta2 "google.golang.org/api/cloudtasks/v2beta2"
+	"google.golang.org/api/googleapi"
 	"github.com/golang/protobuf/proto"
 
 	"google.golang.org/appengine"
 	"google.golang.org/appengine/internal"
 	dspb "google.golang.org/appengine/internal/datastore"
 	pb "google.golang.org/appengine/internal/taskqueue"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+const (
+	gaePushqueueBackendEnv = "GAE_PUSHQUEUE_BACKEND"
+	cloudTaskBackend       = "CLOUD_TASK"
+	legacyBackend          = "LEGACY"
+
+	googleCloudProjectEnv = "GOOGLE_CLOUD_PROJECT"
+	cloudTasksLocationEnv = "CLOUD_TASKS_LOCATION"
+
+	queuePathTemplate      = "projects/%s/locations/%s/queues/%s"
+	queuePurgePathTemplate = "projects/%s/locations/%s/queues/%s:purge"
+	taskPathTemplate       = "projects/%s/locations/%s/queues/%s/tasks/%s"
+)
+
+var (
+	ctClient     *cloudtasks.Client
+	ctClientOnce sync.Once
+
+	ctRESTClient     *cloudtasksv2beta2.Service
+	ctRESTClientOnce sync.Once
+
+	// BackendUsed indicates the backend that was used for the last operation.
+	// Possible values are "CLOUD_TASKS" or "LEGACY".
+	BackendUsed     string
+	ctClientErr     error
+	ctRESTClientErr error
+)
+
+const (
+	cloudTasksBackendName = "CLOUD_TASKS"
+	legacyBackendName     = "LEGACY"
+)
+
+func shouldUseCloudTasks() bool {
+	backend := os.Getenv(gaePushqueueBackendEnv)
+	if backend == "" {
+		backend = legacyBackend
+	}
+
+	if backend == cloudTaskBackend {
+		return true
+	}
+
+	if backend != legacyBackend {
+		log.Printf("Unrecognized value for %s: %s. Defaulting to LEGACY.", gaePushqueueBackendEnv, backend)
+	}
+
+	return false
+}
+
+func getCloudTasksProjectAndLocation() (string, string) {
+	project := os.Getenv(googleCloudProjectEnv)
+	location := os.Getenv(cloudTasksLocationEnv)
+	if location == "" {
+		location = "us-central1"
+	}
+	return project, location
+}
+
+func getCloudTasksQueuePath(queueName string) string {
+	project, location := getCloudTasksProjectAndLocation()
+	return fmt.Sprintf(queuePathTemplate, project, location, queueName)
+}
+
+func getCloudTasksQueuePurgePath(queueName string) string {
+	project, location := getCloudTasksProjectAndLocation()
+	return fmt.Sprintf(queuePurgePathTemplate, project, location, queueName)
+}
+
+func getCloudTasksTaskPath(queueName, taskName string) string {
+	project, location := getCloudTasksProjectAndLocation()
+	return fmt.Sprintf(taskPathTemplate, project, location, queueName, taskName)
+}
+
+func getCTClient(ctx context.Context) (*cloudtasks.Client, error) {
+	ctClientOnce.Do(func() {
+		var err error
+		ctClient, err = cloudtasks.NewClient(context.Background())
+		if err != nil {
+			ctClientErr = err
+		}
+	})
+	return ctClient, ctClientErr
+}
+
+func getCTRESTClient(ctx context.Context) (*cloudtasksv2beta2.Service, error) {
+	ctRESTClientOnce.Do(func() {
+		var err error
+		ctRESTClient, err = cloudtasksv2beta2.NewService(context.Background())
+		if err != nil {
+			ctRESTClientErr = err
+		}
+	})
+	return ctRESTClient, ctRESTClientErr
+}
 
 var (
 	// ErrTaskAlreadyAdded is the error returned by Add and AddMulti when a task has already been added with a particular name.
@@ -127,6 +233,10 @@ type Task struct {
 
 	// Retry options for this task. May be nil.
 	RetryOptions *RetryOptions
+
+	// BackendUsed is the backend used to process the task.
+	// It is either "CLOUD_TASKS" or "LEGACY".
+	BackendUsed string
 }
 
 func (t *Task) method() string {
@@ -278,11 +388,137 @@ var alreadyAddedErrors = map[pb.TaskQueueServiceError_ErrorCode]bool{
 	pb.TaskQueueServiceError_TOMBSTONED_TASK:     true,
 }
 
+func addCloudTasks(c context.Context, task *Task, queueName string) (*Task, error) {
+	if queueName == "" {
+		queueName = "default"
+	}
+	client, err := getCTClient(c)
+	if err != nil {
+		return nil, err
+	}
+
+	queuePath := getCloudTasksQueuePath(queueName)
+
+	ctTask := &taskspb.Task{}
+
+	if task.Name != "" {
+		ctTask.Name = getCloudTasksTaskPath(queueName, task.Name)
+	}
+
+	if !task.ETA.IsZero() {
+		ctTask.ScheduleTime = timestamppb.New(task.ETA)
+	} else if task.Delay != 0 {
+		ctTask.ScheduleTime = timestamppb.New(time.Now().Add(task.Delay))
+	}
+
+	method := task.method()
+	if method == "PULL" {
+		return nil, errors.New("taskqueue: pull tasks are not supported in Cloud Tasks")
+	}
+
+	httpMethodMap := map[string]taskspb.HttpMethod{
+		"GET":    taskspb.HttpMethod_GET,
+		"POST":   taskspb.HttpMethod_POST,
+		"HEAD":   taskspb.HttpMethod_HEAD,
+		"PUT":    taskspb.HttpMethod_PUT,
+		"DELETE": taskspb.HttpMethod_DELETE,
+	}
+
+	ctHttpMethod, ok := httpMethodMap[method]
+	if !ok {
+		ctHttpMethod = taskspb.HttpMethod_POST
+	}
+
+	relativeURI := task.Path
+	if relativeURI == "" {
+		relativeURI = "/_ah/queue/" + queueName
+	}
+
+	headers := make(map[string]string)
+	for k, vs := range task.Header {
+		if len(vs) > 0 {
+			headers[k] = vs[0]
+		}
+	}
+
+	appEngineReq := &taskspb.AppEngineHttpRequest{
+		HttpMethod:  ctHttpMethod,
+		RelativeUri: relativeURI,
+		Headers:     headers,
+	}
+
+	if task.Payload != nil {
+		appEngineReq.Body = task.Payload
+	}
+
+	// Namespace headers.
+	if _, ok := task.Header[currentNamespace]; !ok {
+		// Fetch the current namespace of this request.
+		if ns := internal.NamespaceFromContext(c); ns != "" {
+			if appEngineReq.Headers == nil {
+				appEngineReq.Headers = make(map[string]string)
+			}
+			appEngineReq.Headers[currentNamespace] = ns
+		}
+	}
+	if _, ok := task.Header[defaultNamespace]; !ok {
+		// Fetch the X-AppEngine-Default-Namespace header of this request.
+		if ns := getDefaultNamespace(c); ns != "" {
+			if appEngineReq.Headers == nil {
+				appEngineReq.Headers = make(map[string]string)
+			}
+			appEngineReq.Headers[defaultNamespace] = ns
+		}
+	}
+
+	ctTask.MessageType = &taskspb.Task_AppEngineHttpRequest{
+		AppEngineHttpRequest: appEngineReq,
+	}
+
+	req := &taskspb.CreateTaskRequest{
+		Parent: queuePath,
+		Task:   ctTask,
+	}
+
+	respTask, err := client.CreateTask(c, req)
+	if err != nil {
+		st, ok := status.FromError(err)
+		if ok {
+			switch st.Code() {
+			case codes.AlreadyExists:
+				return nil, ErrTaskAlreadyAdded
+			case codes.NotFound:
+				return nil, errors.New("taskqueue: UNKNOWN_QUEUE")
+			case codes.PermissionDenied:
+				return nil, errors.New("taskqueue: PERMISSION_DENIED")
+			case codes.DeadlineExceeded, codes.Unavailable:
+				return nil, errors.New("taskqueue: TRANSIENT_ERROR")
+			}
+		}
+		return nil, err
+	}
+
+	resultTask := *task
+	resultTask.Method = method
+	resultTask.BackendUsed = cloudTasksBackendName
+	if task.Name == "" && respTask.Name != "" {
+		// Name from Cloud Tasks API is the full path. We just want the last part.
+		resultTask.Name = path.Base(respTask.Name)
+	}
+	return &resultTask, nil
+}
+
 // Add adds the task to a named queue.
 // An empty queue name means that the default queue will be used.
 // Add returns an equivalent Task with defaults filled in, including setting
 // the task's Name field to the chosen name if the original was empty.
 func Add(c context.Context, task *Task, queueName string) (*Task, error) {
+	if shouldUseCloudTasks() {
+		BackendUsed = cloudTasksBackendName
+		return addCloudTasks(c, task, queueName)
+	}
+	BackendUsed = legacyBackendName
+
 	req, err := newAddReq(c, task, queueName)
 	if err != nil {
 		return nil, err
@@ -297,6 +533,7 @@ func Add(c context.Context, task *Task, queueName string) (*Task, error) {
 	}
 	resultTask := *task
 	resultTask.Method = task.method()
+	resultTask.BackendUsed = BackendUsed
 	if task.Name == "" {
 		resultTask.Name = string(res.ChosenTaskName)
 	}
@@ -309,6 +546,24 @@ func Add(c context.Context, task *Task, queueName string) (*Task, error) {
 // each task's Name field to the chosen name if the original was empty.
 // If a given task is badly formed or could not be added, an appengine.MultiError is returned.
 func AddMulti(c context.Context, tasks []*Task, queueName string) ([]*Task, error) {
+	if shouldUseCloudTasks() {
+		BackendUsed = cloudTasksBackendName
+		if len(tasks) > 1 {
+			return nil, errors.New("taskqueue: Batch operations are not supported in Cloud Tasks path yet")
+		}
+		if len(tasks) == 0 {
+			return []*Task{}, nil
+		}
+		t, err := addCloudTasks(c, tasks[0], queueName)
+		if err != nil {
+			me := make(appengine.MultiError, 1)
+			me[0] = err
+			return nil, me
+		}
+		return []*Task{t}, nil
+	}
+	BackendUsed = legacyBackendName
+
 	req := &pb.TaskQueueBulkAddRequest{
 		AddRequest: make([]*pb.TaskQueueAddRequest, len(tasks)),
 	}
@@ -332,6 +587,7 @@ func AddMulti(c context.Context, tasks []*Task, queueName string) ([]*Task, erro
 		tasksOut[i] = new(Task)
 		*tasksOut[i] = *tasks[i]
 		tasksOut[i].Method = tasksOut[i].method()
+		tasksOut[i].BackendUsed = BackendUsed
 		if tasksOut[i].Name == "" {
 			tasksOut[i].Name = string(tr.ChosenTaskName)
 		}
@@ -367,13 +623,47 @@ func Delete(c context.Context, task *Task, queueName string) error {
 // Each task is deleted independently; one may fail to delete while the others
 // are successfully deleted.
 func DeleteMulti(c context.Context, tasks []*Task, queueName string) error {
+	if queueName == "" {
+		queueName = "default"
+	}
+
+	if shouldUseCloudTasks() {
+		BackendUsed = cloudTasksBackendName
+		if len(tasks) > 1 {
+			return errors.New("taskqueue: Batch delete is not supported in Cloud Tasks path yet")
+		}
+		if len(tasks) == 0 {
+			return nil
+		}
+		client, err := getCTClient(c)
+		if err != nil {
+			return err
+		}
+		task := tasks[0]
+		if task.Name == "" {
+			return errors.New("taskqueue: A task name must be specified for a task")
+		}
+
+		path := getCloudTasksTaskPath(queueName, task.Name)
+		req := &taskspb.DeleteTaskRequest{
+			Name: path,
+		}
+
+		err = client.DeleteTask(c, req)
+		if err != nil {
+			me := make(appengine.MultiError, 1)
+			me[0] = err
+			return me
+		}
+		return nil
+	}
+	BackendUsed = legacyBackendName
+
 	taskNames := make([][]byte, len(tasks))
 	for i, t := range tasks {
 		taskNames[i] = []byte(t.Name)
 	}
-	if queueName == "" {
-		queueName = "default"
-	}
+
 	req := &pb.TaskQueueDeleteRequest{
 		QueueName: []byte(queueName),
 		TaskName:  taskNames,
@@ -450,6 +740,24 @@ func Purge(c context.Context, queueName string) error {
 	if queueName == "" {
 		queueName = "default"
 	}
+
+	if shouldUseCloudTasks() {
+		BackendUsed = cloudTasksBackendName
+		client, err := getCTClient(c)
+		if err != nil {
+			return err
+		}
+
+		path := getCloudTasksQueuePurgePath(queueName)
+		req := &taskspb.PurgeQueueRequest{
+			Name: path,
+		}
+
+		_, err = client.PurgeQueue(c, req)
+		return err
+	}
+	BackendUsed = legacyBackendName
+
 	req := &pb.TaskQueuePurgeQueueRequest{
 		QueueName: []byte(queueName),
 	}
@@ -486,10 +794,61 @@ type QueueStatistics struct {
 	Executed1Minute int     // tasks executed in the last minute
 	InFlight        int     // tasks executing now
 	EnforcedRate    float64 // requests per second
+
+	// BackendUsed is the backend used to fetch the statistics.
+	// It is either "CLOUD_TASKS" or "LEGACY".
+	BackendUsed string
+}
+
+func queueStatsCloudTasks(c context.Context, queueNames []string) ([]QueueStatistics, error) {
+	service, err := getCTRESTClient(c)
+	if err != nil {
+		return nil, err
+	}
+
+	qs := make([]QueueStatistics, len(queueNames))
+	for i, q := range queueNames {
+		if q == "" {
+			q = "default"
+		}
+		qPath := getCloudTasksQueuePath(q)
+		ctQueue, err := service.Projects.Locations.Queues.Get(qPath).ReadMask("stats").Context(c).Do()
+		if err != nil {
+			if gErr, ok := err.(*googleapi.Error); ok && gErr.Code == http.StatusNotFound {
+				// Equivalent to UnknownQueueError in python
+				qs[i] = QueueStatistics{Tasks: 0, OldestETA: time.Time{}, BackendUsed: cloudTasksBackendName}
+				continue
+			}
+			return nil, err
+		} else if ctQueue.Stats != nil {
+			qs[i] = QueueStatistics{
+				Tasks:           int(ctQueue.Stats.TasksCount),
+				Executed1Minute: int(ctQueue.Stats.ExecutedLastMinuteCount),
+				InFlight:        int(ctQueue.Stats.ConcurrentDispatchesCount),
+				EnforcedRate:    ctQueue.Stats.EffectiveExecutionRate,
+				BackendUsed:     cloudTasksBackendName,
+			}
+			if ctQueue.Stats.OldestEstimatedArrivalTime != "" {
+				t, err := time.Parse(time.RFC3339, ctQueue.Stats.OldestEstimatedArrivalTime)
+				if err == nil {
+					qs[i].OldestETA = t
+				}
+			}
+		} else {
+			qs[i] = QueueStatistics{Tasks: 0, OldestETA: time.Time{}, BackendUsed: cloudTasksBackendName}
+		}
+	}
+	return qs, nil
 }
 
 // QueueStats retrieves statistics about queues.
 func QueueStats(c context.Context, queueNames []string) ([]QueueStatistics, error) {
+	if shouldUseCloudTasks() {
+		BackendUsed = cloudTasksBackendName
+		return queueStatsCloudTasks(c, queueNames)
+	}
+	BackendUsed = legacyBackendName
+
 	req := &pb.TaskQueueFetchQueueStatsRequest{
 		QueueName: make([][]byte, len(queueNames)),
 	}
@@ -506,7 +865,8 @@ func QueueStats(c context.Context, queueNames []string) ([]QueueStatistics, erro
 	qs := make([]QueueStatistics, len(res.Queuestats))
 	for i, qsg := range res.Queuestats {
 		qs[i] = QueueStatistics{
-			Tasks: int(*qsg.NumTasks),
+			Tasks:       int(*qsg.NumTasks),
+			BackendUsed: BackendUsed,
 		}
 		if eta := *qsg.OldestEtaUsec; eta > -1 {
 			qs[i].OldestETA = time.Unix(0, eta*1e3)
