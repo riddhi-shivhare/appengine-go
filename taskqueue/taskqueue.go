@@ -65,28 +65,19 @@ var (
 	ctRESTClientOnce sync.Once
 
 	// BackendUsed indicates the backend that was used for the last operation.
-	// Possible values are "CLOUD_TASKS" or "LEGACY".
+	// Possible values are "CLOUD_TASK" or "LEGACY".
 	BackendUsed     string
 	ctClientErr     error
 	ctRESTClientErr error
 )
 
-const (
-	cloudTasksBackendName = "CLOUD_TASKS"
-	legacyBackendName     = "LEGACY"
-)
-
 func shouldUseCloudTasks() bool {
 	backend := os.Getenv(gaePushqueueBackendEnv)
-	if backend == "" {
-		backend = legacyBackend
-	}
-
 	if backend == cloudTaskBackend {
 		return true
 	}
 
-	if backend != legacyBackend {
+	if backend != "" && backend != legacyBackend {
 		log.Printf("Unrecognized value for %s: %s. Defaulting to LEGACY.", gaePushqueueBackendEnv, backend)
 	}
 
@@ -98,6 +89,7 @@ func getCloudTasksProjectAndLocation() (string, string) {
 	location := os.Getenv(cloudTasksLocationEnv)
 	if location == "" {
 		location = "us-central1"
+		log.Printf("Cloud Tasks location not set. Defaulting to %s", location)
 	}
 	return project, location
 }
@@ -235,7 +227,7 @@ type Task struct {
 	RetryOptions *RetryOptions
 
 	// BackendUsed is the backend used to process the task.
-	// It is either "CLOUD_TASKS" or "LEGACY".
+	// It is either "CLOUD_TASK" or "LEGACY".
 	BackendUsed string
 }
 
@@ -391,6 +383,7 @@ var alreadyAddedErrors = map[pb.TaskQueueServiceError_ErrorCode]bool{
 func addCloudTasks(c context.Context, task *Task, queueName string) (*Task, error) {
 	if queueName == "" {
 		queueName = "default"
+		log.Printf("Queue name not specified. Defaulting to %s", queueName)
 	}
 	client, err := getCTClient(c)
 	if err != nil {
@@ -500,7 +493,7 @@ func addCloudTasks(c context.Context, task *Task, queueName string) (*Task, erro
 
 	resultTask := *task
 	resultTask.Method = method
-	resultTask.BackendUsed = cloudTasksBackendName
+	resultTask.BackendUsed = cloudTaskBackend
 	if task.Name == "" && respTask.Name != "" {
 		// Name from Cloud Tasks API is the full path. We just want the last part.
 		resultTask.Name = path.Base(respTask.Name)
@@ -514,10 +507,10 @@ func addCloudTasks(c context.Context, task *Task, queueName string) (*Task, erro
 // the task's Name field to the chosen name if the original was empty.
 func Add(c context.Context, task *Task, queueName string) (*Task, error) {
 	if shouldUseCloudTasks() {
-		BackendUsed = cloudTasksBackendName
+		BackendUsed = cloudTaskBackend
 		return addCloudTasks(c, task, queueName)
 	}
-	BackendUsed = legacyBackendName
+	BackendUsed = legacyBackend
 
 	req, err := newAddReq(c, task, queueName)
 	if err != nil {
@@ -547,8 +540,9 @@ func Add(c context.Context, task *Task, queueName string) (*Task, error) {
 // If a given task is badly formed or could not be added, an appengine.MultiError is returned.
 func AddMulti(c context.Context, tasks []*Task, queueName string) ([]*Task, error) {
 	if shouldUseCloudTasks() {
-		BackendUsed = cloudTasksBackendName
+		BackendUsed = cloudTaskBackend
 		if len(tasks) > 1 {
+			// TODO: Add support for batch operations in Cloud Tasks path.
 			return nil, errors.New("taskqueue: Batch operations are not supported in Cloud Tasks path yet")
 		}
 		if len(tasks) == 0 {
@@ -562,7 +556,7 @@ func AddMulti(c context.Context, tasks []*Task, queueName string) ([]*Task, erro
 		}
 		return []*Task{t}, nil
 	}
-	BackendUsed = legacyBackendName
+	BackendUsed = legacyBackend
 
 	req := &pb.TaskQueueBulkAddRequest{
 		AddRequest: make([]*pb.TaskQueueAddRequest, len(tasks)),
@@ -628,7 +622,7 @@ func DeleteMulti(c context.Context, tasks []*Task, queueName string) error {
 	}
 
 	if shouldUseCloudTasks() {
-		BackendUsed = cloudTasksBackendName
+		BackendUsed = cloudTaskBackend
 		if len(tasks) > 1 {
 			return errors.New("taskqueue: Batch delete is not supported in Cloud Tasks path yet")
 		}
@@ -657,7 +651,7 @@ func DeleteMulti(c context.Context, tasks []*Task, queueName string) error {
 		}
 		return nil
 	}
-	BackendUsed = legacyBackendName
+	BackendUsed = legacyBackend
 
 	taskNames := make([][]byte, len(tasks))
 	for i, t := range tasks {
@@ -742,7 +736,7 @@ func Purge(c context.Context, queueName string) error {
 	}
 
 	if shouldUseCloudTasks() {
-		BackendUsed = cloudTasksBackendName
+		BackendUsed = cloudTaskBackend
 		client, err := getCTClient(c)
 		if err != nil {
 			return err
@@ -756,7 +750,7 @@ func Purge(c context.Context, queueName string) error {
 		_, err = client.PurgeQueue(c, req)
 		return err
 	}
-	BackendUsed = legacyBackendName
+	BackendUsed = legacyBackend
 
 	req := &pb.TaskQueuePurgeQueueRequest{
 		QueueName: []byte(queueName),
@@ -796,7 +790,7 @@ type QueueStatistics struct {
 	EnforcedRate    float64 // requests per second
 
 	// BackendUsed is the backend used to fetch the statistics.
-	// It is either "CLOUD_TASKS" or "LEGACY".
+	// It is either "CLOUD_TASK" or "LEGACY".
 	BackendUsed string
 }
 
@@ -816,7 +810,7 @@ func queueStatsCloudTasks(c context.Context, queueNames []string) ([]QueueStatis
 		if err != nil {
 			if gErr, ok := err.(*googleapi.Error); ok && gErr.Code == http.StatusNotFound {
 				// Equivalent to UnknownQueueError in python
-				qs[i] = QueueStatistics{Tasks: 0, OldestETA: time.Time{}, BackendUsed: cloudTasksBackendName}
+				qs[i] = QueueStatistics{Tasks: 0, OldestETA: time.Time{}, BackendUsed: cloudTaskBackend}
 				continue
 			}
 			return nil, err
@@ -826,7 +820,7 @@ func queueStatsCloudTasks(c context.Context, queueNames []string) ([]QueueStatis
 				Executed1Minute: int(ctQueue.Stats.ExecutedLastMinuteCount),
 				InFlight:        int(ctQueue.Stats.ConcurrentDispatchesCount),
 				EnforcedRate:    ctQueue.Stats.EffectiveExecutionRate,
-				BackendUsed:     cloudTasksBackendName,
+				BackendUsed:     cloudTaskBackend,
 			}
 			if ctQueue.Stats.OldestEstimatedArrivalTime != "" {
 				t, err := time.Parse(time.RFC3339, ctQueue.Stats.OldestEstimatedArrivalTime)
@@ -835,7 +829,7 @@ func queueStatsCloudTasks(c context.Context, queueNames []string) ([]QueueStatis
 				}
 			}
 		} else {
-			qs[i] = QueueStatistics{Tasks: 0, OldestETA: time.Time{}, BackendUsed: cloudTasksBackendName}
+			qs[i] = QueueStatistics{Tasks: 0, OldestETA: time.Time{}, BackendUsed: cloudTaskBackend}
 		}
 	}
 	return qs, nil
@@ -844,10 +838,10 @@ func queueStatsCloudTasks(c context.Context, queueNames []string) ([]QueueStatis
 // QueueStats retrieves statistics about queues.
 func QueueStats(c context.Context, queueNames []string) ([]QueueStatistics, error) {
 	if shouldUseCloudTasks() {
-		BackendUsed = cloudTasksBackendName
+		BackendUsed = cloudTaskBackend
 		return queueStatsCloudTasks(c, queueNames)
 	}
-	BackendUsed = legacyBackendName
+	BackendUsed = legacyBackend
 
 	req := &pb.TaskQueueFetchQueueStatsRequest{
 		QueueName: make([][]byte, len(queueNames)),
