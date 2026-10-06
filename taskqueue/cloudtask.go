@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/api/option"
 	"google.golang.org/appengine"
 	"google.golang.org/appengine/datastore"
 	"google.golang.org/appengine/internal"
@@ -41,6 +42,8 @@ const (
 
 var (
 	taskNameRegex                = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	metadataRegionURL            = "http://metadata.google.internal/computeMetadata/v1/instance/region"
+	cloudTasksClientOpts         []option.ClientOption
 	ErrTooManyTasksInTransaction = &internal.APIError{
 		Service: "taskqueue",
 		Detail:  "too many tasks in transaction",
@@ -93,7 +96,7 @@ func getQueuePath(ctx context.Context, queueName string) (string, error) {
 }
 
 func getRegion(ctx context.Context) (string, error) {
-	req, err := http.NewRequest("GET", "http://metadata.google.internal/computeMetadata/v1/instance/region", nil)
+	req, err := http.NewRequest("GET", metadataRegionURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -123,7 +126,7 @@ func sendTask(ctx context.Context, queueName string, taskName string, taskObj *t
 		return "", err
 	}
 
-	client, err := cloudtasks.NewClient(ctx)
+	client, err := cloudtasks.NewClient(ctx, cloudTasksClientOpts...)
 	if err != nil {
 		return "", fmt.Errorf("failed to create cloudtasks client: %v", err)
 	}
@@ -273,7 +276,7 @@ func buildCloudTaskProto(ctx context.Context, queueName string, task *Task) (*ta
 
 	taskObj := &taskspb.Task{
 		Name: fullTaskName,
-		PayloadType: &taskspb.Task_AppEngineHttpRequest{
+		MessageType: &taskspb.Task_AppEngineHttpRequest{
 			AppEngineHttpRequest: ae,
 		},
 	}
@@ -418,7 +421,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 	me, any := make(appengine.MultiError, len(tasks)), false
 	results := make([]*Task, len(tasks))
 
-	client, err := cloudtasks.NewClient(ctx)
+	client, err := cloudtasks.NewClient(ctx, cloudTasksClientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cloudtasks client: %v", err)
 	}
@@ -483,8 +486,9 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 				}
 			}
 		} else if op != nil {
-			meta, _ := op.Metadata()
 			resp, _ := op.Wait(ctx)
+			meta, _ := op.Metadata()
+			respIdx := 0
 			for i := range chunkTasks {
 				if meta != nil && meta.FailedRequests != nil {
 					if st, failed := meta.FailedRequests[int32(i)]; failed && st != nil && st.Code != 0 {
@@ -493,9 +497,10 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 						continue
 					}
 				}
-				if resp != nil && i < len(resp.Tasks) && resp.Tasks[i] != nil {
-					createdTask := resp.Tasks[i]
-					if createdTask.Name != "" && results[chunkStart+i] != nil {
+				if resp != nil && respIdx < len(resp.Tasks) {
+					createdTask := resp.Tasks[respIdx]
+					respIdx++
+					if createdTask != nil && createdTask.Name != "" && results[chunkStart+i] != nil {
 						if idx := strings.LastIndex(createdTask.Name, "/"); idx != -1 {
 							results[chunkStart+i].Name = createdTask.Name[idx+1:]
 						} else {
@@ -519,7 +524,7 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 		return err
 	}
 
-	client, err := cloudtasks.NewClient(ctx)
+	client, err := cloudtasks.NewClient(ctx, cloudTasksClientOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to create cloudtasks client: %v", err)
 	}
@@ -552,6 +557,7 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 				any = true
 			}
 		} else if op != nil {
+			_ = op.Wait(ctx)
 			meta, _ := op.Metadata()
 			for i := range chunkTasks {
 				if meta != nil && meta.FailedRequests != nil {
@@ -591,7 +597,7 @@ func mapOperationErrorCode(code int, msg string, isDelete bool) error {
 
 func queueStatsInCloudTasks(ctx context.Context, queueNames []string) ([]QueueStatistics, error) {
 	// QueueStats is retained on v2beta3 as it is out of scope for v2 GA
-	client, err := cloudtasksbeta.NewClient(ctx)
+	client, err := cloudtasksbeta.NewClient(ctx, cloudTasksClientOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cloudtasks client: %v", err)
 	}
