@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/api/option"
@@ -16,11 +17,11 @@ import (
 	"google.golang.org/appengine/datastore"
 	"google.golang.org/appengine/internal"
 	pb "google.golang.org/appengine/internal/taskqueue"
+	rpcstatus "google.golang.org/genproto/googleapis/rpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
-
 
 	cloudtasks "cloud.google.com/go/cloudtasks/apiv2"
 	taskspb "cloud.google.com/go/cloudtasks/apiv2/cloudtaskspb"
@@ -50,6 +51,46 @@ var (
 		Code:    int32(pb.TaskQueueServiceError_TOO_MANY_TASKS),
 	}
 )
+
+var (
+	// Cloud Tasks gRPC clients are expensive to create (credentials lookup,
+	// connection setup), so they are created lazily once and reused for the
+	// lifetime of the process. They are safe for concurrent use.
+	cloudTasksClientMu   sync.Mutex
+	cloudTasksClient     *cloudtasks.Client
+	cloudTasksBetaClient *cloudtasksbeta.Client
+)
+
+// getCloudTasksClient returns the shared Cloud Tasks v2 client, creating it on
+// first use. A failed creation is not cached, so the next call retries.
+func getCloudTasksClient() (*cloudtasks.Client, error) {
+	cloudTasksClientMu.Lock()
+	defer cloudTasksClientMu.Unlock()
+	if cloudTasksClient == nil {
+		// context.Background is used because the client outlives the request.
+		c, err := cloudtasks.NewClient(context.Background(), cloudTasksClientOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create cloudtasks client: %v", err)
+		}
+		cloudTasksClient = c
+	}
+	return cloudTasksClient, nil
+}
+
+// getCloudTasksBetaClient returns the shared Cloud Tasks v2beta3 client, used
+// only for QueueStats, creating it on first use.
+func getCloudTasksBetaClient() (*cloudtasksbeta.Client, error) {
+	cloudTasksClientMu.Lock()
+	defer cloudTasksClientMu.Unlock()
+	if cloudTasksBetaClient == nil {
+		c, err := cloudtasksbeta.NewClient(context.Background(), cloudTasksClientOpts...)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create cloudtasks v2beta3 client: %v", err)
+		}
+		cloudTasksBetaClient = c
+	}
+	return cloudTasksBetaClient, nil
+}
 
 func useCloudTasks() bool {
 	v, _ := strconv.ParseBool(os.Getenv("APPENGINE_USE_CLOUDTASK_PUSH_QUEUE"))
@@ -126,11 +167,10 @@ func sendTask(ctx context.Context, queueName string, taskName string, taskObj *t
 		return "", err
 	}
 
-	client, err := cloudtasks.NewClient(ctx, cloudTasksClientOpts...)
+	client, err := getCloudTasksClient()
 	if err != nil {
-		return "", fmt.Errorf("failed to create cloudtasks client: %v", err)
+		return "", err
 	}
-	defer client.Close()
 
 	req := &taskspb.CreateTaskRequest{
 		Parent: parent,
@@ -421,11 +461,10 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 	me, any := make(appengine.MultiError, len(tasks)), false
 	results := make([]*Task, len(tasks))
 
-	client, err := cloudtasks.NewClient(ctx, cloudTasksClientOpts...)
+	client, err := getCloudTasksClient()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create cloudtasks client: %v", err)
+		return nil, err
 	}
-	defer client.Close()
 
 	chunkSize := batchCreateChunkSize
 	for chunkStart := 0; chunkStart < len(tasks); chunkStart += chunkSize {
@@ -436,6 +475,9 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 		chunkTasks := tasks[chunkStart:chunkEnd]
 
 		createReqs := make([]*taskspb.CreateTaskRequest, 0, len(chunkTasks))
+		// reqTaskIdx[j] is the index in tasks of createReqs[j]. Tasks that fail
+		// to build are not sent, so request indices can differ from task indices.
+		reqTaskIdx := make([]int, 0, len(chunkTasks))
 		for i, t := range chunkTasks {
 			taskObj, taskName, err := buildCloudTaskProto(ctx, queueName, t)
 			if err != nil {
@@ -452,6 +494,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 				Parent: fullQueueName,
 				Task:   taskObj,
 			})
+			reqTaskIdx = append(reqTaskIdx, chunkStart+i)
 		}
 		if len(createReqs) == 0 {
 			continue
@@ -465,47 +508,54 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 		op, err := client.BatchCreateTasks(ctx, batchReq)
 		if err != nil {
 			if isUnimplementedError(err) {
-				for i, t := range chunkTasks {
-					if me[chunkStart+i] != nil {
-						continue
-					}
-					res, err := addInCloudTasks(ctx, t, queueName)
+				for _, ti := range reqTaskIdx {
+					res, err := addInCloudTasks(ctx, tasks[ti], queueName)
 					if err != nil {
-						me[chunkStart+i] = err
+						me[ti] = err
 						any = true
 					} else {
-						results[chunkStart+i] = res
+						results[ti] = res
 					}
 				}
 			} else {
-				for i := range chunkTasks {
-					if me[chunkStart+i] == nil {
-						me[chunkStart+i] = err
-						any = true
-					}
+				for _, ti := range reqTaskIdx {
+					me[ti] = err
+					any = true
 				}
 			}
-		} else if op != nil {
-			resp, _ := op.Wait(ctx)
-			meta, _ := op.Metadata()
-			respIdx := 0
-			for i := range chunkTasks {
-				if meta != nil && meta.FailedRequests != nil {
-					if st, failed := meta.FailedRequests[int32(i)]; failed && st != nil && st.Code != 0 {
-						me[chunkStart+i] = mapOperationErrorCode(int(st.Code), st.Message, false)
-						any = true
-						continue
-					}
-				}
-				if resp != nil && respIdx < len(resp.Tasks) {
-					createdTask := resp.Tasks[respIdx]
-					respIdx++
-					if createdTask != nil && createdTask.Name != "" && results[chunkStart+i] != nil {
-						if idx := strings.LastIndex(createdTask.Name, "/"); idx != -1 {
-							results[chunkStart+i].Name = createdTask.Name[idx+1:]
-						} else {
-							results[chunkStart+i].Name = createdTask.Name
-						}
+			continue
+		}
+		if op == nil {
+			continue
+		}
+		resp, waitErr := op.Wait(ctx)
+		var failedReqs map[int32]*rpcstatus.Status
+		if meta, metaErr := op.Metadata(); metaErr == nil && meta != nil {
+			failedReqs = meta.FailedRequests
+		}
+		respIdx := 0
+		for j, ti := range reqTaskIdx {
+			if st, failed := failedReqs[int32(j)]; failed && st != nil && st.Code != 0 {
+				me[ti] = mapOperationErrorCode(int(st.Code), st.Message, false)
+				any = true
+				continue
+			}
+			// The operation failed and this request has no per-request status
+			// (e.g. DEADLINE_EXCEEDED, UNAUTHENTICATED): it was not created.
+			if waitErr != nil {
+				me[ti] = waitErr
+				any = true
+				continue
+			}
+			// resp.Tasks contains only the successfully created tasks, in request order.
+			if resp != nil && respIdx < len(resp.Tasks) {
+				createdTask := resp.Tasks[respIdx]
+				respIdx++
+				if createdTask != nil && createdTask.Name != "" && results[ti] != nil {
+					if idx := strings.LastIndex(createdTask.Name, "/"); idx != -1 {
+						results[ti].Name = createdTask.Name[idx+1:]
+					} else {
+						results[ti].Name = createdTask.Name
 					}
 				}
 			}
@@ -524,11 +574,10 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 		return err
 	}
 
-	client, err := cloudtasks.NewClient(ctx, cloudTasksClientOpts...)
+	client, err := getCloudTasksClient()
 	if err != nil {
-		return fmt.Errorf("failed to create cloudtasks client: %v", err)
+		return err
 	}
-	defer client.Close()
 
 	me, any := make(appengine.MultiError, len(tasks)), false
 
@@ -557,14 +606,22 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 				any = true
 			}
 		} else if op != nil {
-			_ = op.Wait(ctx)
-			meta, _ := op.Metadata()
+			waitErr := op.Wait(ctx)
+			var failedReqs map[int32]*rpcstatus.Status
+			if meta, metaErr := op.Metadata(); metaErr == nil && meta != nil {
+				failedReqs = meta.FailedRequests
+			}
 			for i := range chunkTasks {
-				if meta != nil && meta.FailedRequests != nil {
-					if st, failed := meta.FailedRequests[int32(i)]; failed && st != nil && st.Code != 0 {
-						me[chunkStart+i] = mapOperationErrorCode(int(st.Code), st.Message, true)
-						any = true
-					}
+				if st, failed := failedReqs[int32(i)]; failed && st != nil && st.Code != 0 {
+					me[chunkStart+i] = mapOperationErrorCode(int(st.Code), st.Message, true)
+					any = true
+					continue
+				}
+				// The operation failed and this request has no per-request status:
+				// do not report the delete as successful.
+				if waitErr != nil {
+					me[chunkStart+i] = waitErr
+					any = true
 				}
 			}
 		}
@@ -576,8 +633,6 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 	return nil
 }
 
-
-
 func mapOperationErrorCode(code int, msg string, isDelete bool) error {
 	lowerMsg := strings.ToLower(msg)
 	isNotFound := code == grpcNotFound || code == httpNotFound || strings.Contains(lowerMsg, "not found") || strings.Contains(lowerMsg, "unknown")
@@ -586,22 +641,26 @@ func mapOperationErrorCode(code int, msg string, isDelete bool) error {
 	if isDelete && isNotFound {
 		return newUnknownTaskError(msg)
 	}
-	if isAlreadyExists || (isNotFound && strings.Contains(lowerMsg, "requested entity was not found")) {
+	if isAlreadyExists {
 		return ErrTaskAlreadyAdded
 	}
 	if isNotFound {
-		return newUnknownTaskError(msg)
+		// On create, NOT_FOUND refers to the parent queue, not the task.
+		return &internal.APIError{
+			Service: "taskqueue",
+			Detail:  msg,
+			Code:    int32(pb.TaskQueueServiceError_UNKNOWN_QUEUE),
+		}
 	}
 	return fmt.Errorf("cloud tasks operation failed (%d): %s", code, msg)
 }
 
 func queueStatsInCloudTasks(ctx context.Context, queueNames []string) ([]QueueStatistics, error) {
 	// QueueStats is retained on v2beta3 as it is out of scope for v2 GA
-	client, err := cloudtasksbeta.NewClient(ctx, cloudTasksClientOpts...)
+	client, err := getCloudTasksBetaClient()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create cloudtasks client: %v", err)
+		return nil, err
 	}
-	defer client.Close()
 
 	qs := make([]QueueStatistics, len(queueNames))
 	for i, q := range queueNames {
@@ -633,4 +692,3 @@ func queueStatsInCloudTasks(ctx context.Context, queueNames []string) ([]QueueSt
 	}
 	return qs, nil
 }
-

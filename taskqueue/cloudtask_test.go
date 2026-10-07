@@ -110,7 +110,11 @@ func setupCloudTasksTestEnv(t *testing.T, v2Srv *fakeCloudTasksV2Server, betaSrv
 		option.WithoutAuthentication(),
 		option.WithGRPCDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())),
 	}
-	t.Cleanup(func() { cloudTasksClientOpts = prevOpts })
+	resetCloudTasksClients()
+	t.Cleanup(func() {
+		resetCloudTasksClients()
+		cloudTasksClientOpts = prevOpts
+	})
 
 	t.Setenv("APPENGINE_USE_CLOUDTASK_PUSH_QUEUE", "true")
 	t.Setenv("GAE_APPLICATION", "s~test-app")
@@ -366,11 +370,11 @@ func TestQueueStatsInCloudTasks_V2Beta3(t *testing.T) {
 			return &taskspbbeta.Queue{
 				Name: req.GetName(),
 				Stats: &taskspbbeta.QueueStats{
-					TasksCount:                42,
+					TasksCount:                 42,
 					OldestEstimatedArrivalTime: timestamppb.New(eta),
-					ExecutedLastMinuteCount:   7,
-					ConcurrentDispatchesCount: 3,
-					EffectiveExecutionRate:    12.5,
+					ExecutedLastMinuteCount:    7,
+					ConcurrentDispatchesCount:  3,
+					EffectiveExecutionRate:     12.5,
 				},
 			}, nil
 		},
@@ -483,5 +487,154 @@ func TestTransactionalTasksInCloudTasks_StagingAndMaxLimit(t *testing.T) {
 	}
 	if !strings.HasSuffix(unmarshaled.GetAppEngineHttpRequest().GetRelativeUri(), "/worker/tx") {
 		t.Errorf("staged task RelativeUri = %q, want /worker/tx", unmarshaled.GetAppEngineHttpRequest().GetRelativeUri())
+	}
+}
+
+// resetCloudTasksClients drops the cached clients so the next call creates
+// clients with the current cloudTasksClientOpts.
+func resetCloudTasksClients() {
+	cloudTasksClientMu.Lock()
+	defer cloudTasksClientMu.Unlock()
+	if cloudTasksClient != nil {
+		_ = cloudTasksClient.Close()
+		cloudTasksClient = nil
+	}
+	if cloudTasksBetaClient != nil {
+		_ = cloudTasksBetaClient.Close()
+		cloudTasksBetaClient = nil
+	}
+}
+
+func TestCloudTasksClient_ReusedAcrossCalls(t *testing.T) {
+	v2Srv := &fakeCloudTasksV2Server{
+		createTaskFunc: func(_ context.Context, req *taskspb.CreateTaskRequest) (*taskspb.Task, error) {
+			return &taskspb.Task{Name: req.GetParent() + "/tasks/t"}, nil
+		},
+	}
+	ctx := setupCloudTasksTestEnv(t, v2Srv, nil)
+
+	if _, err := Add(ctx, &Task{Path: "/worker"}, "default"); err != nil {
+		t.Fatalf("first Add failed: %v", err)
+	}
+	first := cloudTasksClient
+	if first == nil {
+		t.Fatalf("client was not cached after first Add")
+	}
+	if _, err := Add(ctx, &Task{Path: "/worker"}, "default"); err != nil {
+		t.Fatalf("second Add failed: %v", err)
+	}
+	if cloudTasksClient != first {
+		t.Errorf("client was recreated between calls")
+	}
+}
+
+func TestAddMultiInCloudTasks_OperationWaitError(t *testing.T) {
+	v2Srv := &fakeCloudTasksV2Server{
+		batchCreateTasksFunc: func(_ context.Context, req *taskspb.BatchCreateTasksRequest) (*longrunningpb.Operation, error) {
+			return &longrunningpb.Operation{
+				Name:   "operations/batch-create-failed",
+				Done:   true,
+				Result: &longrunningpb.Operation_Error{Error: &rpcstatus.Status{Code: int32(codes.DeadlineExceeded), Message: "deadline exceeded"}},
+			}, nil
+		},
+	}
+	ctx := setupCloudTasksTestEnv(t, v2Srv, nil)
+
+	_, err := AddMulti(ctx, []*Task{{Path: "/worker"}, {Path: "/worker"}}, "default")
+	me, ok := err.(appengine.MultiError)
+	if !ok {
+		t.Fatalf("expected appengine.MultiError, got %T (%v)", err, err)
+	}
+	for i, e := range me {
+		if status.Code(e) != codes.DeadlineExceeded {
+			t.Errorf("me[%d] = %v, want DeadlineExceeded", i, e)
+		}
+	}
+}
+
+func TestAddMultiInCloudTasks_BuildErrorKeepsRequestIndexMapping(t *testing.T) {
+	v2Srv := &fakeCloudTasksV2Server{
+		batchCreateTasksFunc: func(_ context.Context, req *taskspb.BatchCreateTasksRequest) (*longrunningpb.Operation, error) {
+			if len(req.GetRequests()) != 2 {
+				return nil, status.Errorf(codes.InvalidArgument, "expected 2 requests, got %d", len(req.GetRequests()))
+			}
+			respAny, _ := anypb.New(&taskspb.BatchCreateTasksResponse{
+				Tasks: []*taskspb.Task{{Name: req.GetParent() + "/tasks/created-0"}},
+			})
+			// Request index 1 is the third task, because the second task fails to build.
+			metaAny, _ := anypb.New(&taskspb.BatchCreateTasksMetadata{
+				FailedRequests: map[int32]*rpcstatus.Status{
+					1: {Code: int32(codes.AlreadyExists), Message: "Task already exists"},
+				},
+			})
+			return &longrunningpb.Operation{
+				Name:     "operations/batch-create-op-2",
+				Done:     true,
+				Metadata: metaAny,
+				Result:   &longrunningpb.Operation_Response{Response: respAny},
+			}, nil
+		},
+	}
+	ctx := setupCloudTasksTestEnv(t, v2Srv, nil)
+
+	tasks := []*Task{
+		{Path: "/worker"},
+		{Name: "invalid name", Path: "/worker"},
+		{Name: "dup", Path: "/worker"},
+	}
+	res, err := AddMulti(ctx, tasks, "default")
+	me, ok := err.(appengine.MultiError)
+	if !ok {
+		t.Fatalf("expected appengine.MultiError, got %T (%v)", err, err)
+	}
+	if me[0] != nil {
+		t.Errorf("me[0] = %v, want nil", me[0])
+	}
+	if me[1] == nil || me[1] == ErrTaskAlreadyAdded {
+		t.Errorf("me[1] = %v, want build error", me[1])
+	}
+	if me[2] != ErrTaskAlreadyAdded {
+		t.Errorf("me[2] = %v, want ErrTaskAlreadyAdded", me[2])
+	}
+	if res[0] == nil || res[0].Name != "created-0" {
+		t.Errorf("res[0] = %+v, want Name created-0", res[0])
+	}
+}
+
+func TestDeleteMultiInCloudTasks_OperationWaitError(t *testing.T) {
+	v2Srv := &fakeCloudTasksV2Server{
+		batchDeleteTasksFunc: func(_ context.Context, req *taskspb.BatchDeleteTasksRequest) (*longrunningpb.Operation, error) {
+			return &longrunningpb.Operation{
+				Name:   "operations/batch-delete-failed",
+				Done:   true,
+				Result: &longrunningpb.Operation_Error{Error: &rpcstatus.Status{Code: int32(codes.Unauthenticated), Message: "unauthenticated"}},
+			}, nil
+		},
+	}
+	ctx := setupCloudTasksTestEnv(t, v2Srv, nil)
+
+	err := DeleteMulti(ctx, []*Task{{Name: "t1"}, {Name: "t2"}}, "default")
+	me, ok := err.(appengine.MultiError)
+	if !ok {
+		t.Fatalf("expected appengine.MultiError, got %T (%v)", err, err)
+	}
+	for i, e := range me {
+		if status.Code(e) != codes.Unauthenticated {
+			t.Errorf("me[%d] = %v, want Unauthenticated", i, e)
+		}
+	}
+}
+
+func TestMapOperationErrorCode_NotFoundOnCreateIsUnknownQueue(t *testing.T) {
+	err := mapOperationErrorCode(int(codes.NotFound), "Requested entity was not found.", false)
+	if err == ErrTaskAlreadyAdded {
+		t.Fatalf("NOT_FOUND on create mapped to ErrTaskAlreadyAdded")
+	}
+	apiErr, ok := err.(*internal.APIError)
+	if !ok || apiErr.Code != int32(pb.TaskQueueServiceError_UNKNOWN_QUEUE) {
+		t.Errorf("err = %#v, want UNKNOWN_QUEUE APIError", err)
+	}
+	if got := mapOperationErrorCode(int(codes.AlreadyExists), "Task already exists", false); got != ErrTaskAlreadyAdded {
+		t.Errorf("ALREADY_EXISTS mapped to %v, want ErrTaskAlreadyAdded", got)
 	}
 }
